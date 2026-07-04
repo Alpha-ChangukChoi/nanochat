@@ -181,9 +181,6 @@ class GPT(nn.Module):
         # Separate parameters so they can have different optimizer treatment
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
-        # Smear: mix previous token's embedding into current token (cheap bigram-like info)
-        self.smear_gate = Linear(24, 1, bias=False)
-        self.smear_lambda = nn.Parameter(torch.zeros(1))
         # Backout: subtract cached mid-layer residual before final norm to remove low-level features
         self.backout_lambda = nn.Parameter(0.2 * torch.ones(1))
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
@@ -240,10 +237,8 @@ class GPT(nn.Module):
         for i in range(n_layer):
             self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
 
-        # Smear/backout scalars and smear gate must be explicitly initialized 
-        torch.nn.init.zeros_(self.smear_lambda)
+        # Backout scalar must be explicitly initialized
         torch.nn.init.constant_(self.backout_lambda, 0.2)
-        torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
 
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
@@ -404,7 +399,7 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
+        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.backout_lambda.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
@@ -426,8 +421,8 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        backout_params = [self.backout_lambda]
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(backout_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -441,7 +436,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
-            dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=backout_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
@@ -471,25 +466,6 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # embed current token
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
-
-        # Smear: mix previous token's embedding into current position (cheap bigram info)
-        if kv_cache is None:
-            # Training / naive generate: full sequence available, use fast slice
-            assert T > 1, "Training forward pass should have T > 1"
-            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-            x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
-        else:
-            # KV cache inference: read prev embedding from cache, store current for next step
-            x_pre_smear = kv_cache.prev_embedding
-            kv_cache.prev_embedding = x[:, -1:, :]
-            if T > 1:
-                # Prefill: apply smear to positions 1+, same as training
-                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-                x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
-            elif x_pre_smear is not None:
-                # Decode: single token, use cached prev embedding
-                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
-                x = x + gate * x_pre_smear
 
         # Forward the trunk of the Transformer
         x0 = x  # save initial normalized embedding for x0 residual
