@@ -32,7 +32,8 @@ export NANOCHAT_EXPERIMENT="$EXPERIMENT_NAME"
 # -----------------------------------------------------------------------------
 # Configuration
 
-export OMP_NUM_THREADS=1
+# 1 thread per process is right when GPUs do the math; CPU presets override this
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 # keep python stdout live on the console even though it flows through `tee` pipes
 export PYTHONUNBUFFERED=1
 # shared cache for immutable artifacts: dataset shards, eval bundle
@@ -46,10 +47,11 @@ EXPERIMENT_DIR="$NANOCHAT_BASE_DIR/experiments/$EXPERIMENT_NAME"
 # user-provided directory of parquet shards (see nanochat/dataset.py for the contract).
 export NANOCHAT_DATASET="${NANOCHAT_DATASET:-climbmix}"
 
-# number of pretraining data shards to download, ~100MB of compressed text each.
+# number of pretraining data shards to download, ~100MB (~48M tokens) each.
 # already-downloaded shards are skipped, so this is fast when the cache is warm.
-# TODO: derive from the ladder (the largest depth determines how many are consumed)
-NUM_SHARDS="${NUM_SHARDS:-1000}"
+# the default covers the largest rung of the default ladder: d28 consumes ~287
+# shards at the default param:data ratio of 12. bump it if you grow the ladder.
+NUM_SHARDS="${NUM_SHARDS:-300}"
 
 # the depth ladder: one model is trained per depth, tracing out the cost-perf curve.
 # the default spans exactly 1e18 -> 1e20 FLOPs (~13 hours total on 8xH100), denser at
@@ -59,6 +61,18 @@ DEPTHS="${DEPTHS:-12 14 16 20 24 28}"
 # which stages to run at each depth (e.g. a pretraining researcher: STAGES="base infer")
 STAGES="${STAGES:-base infer sft chat}"
 has_stage() { [[ " $STAGES " == *" $1 "* ]]; }
+# sentinel files: live-edit a running (or resumed) experiment by touching files in
+# its directory. The ladder is a grid of (depth, stage) units; a unit runs iff it is
+# planned (DEPTHS/STAGES), not already done (summary record), and not skipped:
+#   touch $EXPERIMENT_DIR/skip_d24        # skip a depth (all its stages)
+#   touch $EXPERIMENT_DIR/skip_sft        # skip a stage (at all depths)
+#   touch $EXPERIMENT_DIR/skip_d24_sft    # skip one unit
+#   touch $EXPERIMENT_DIR/stop            # start no new units; still aggregate
+# A running script notices at the next unit boundary. Aggregation (curve, report)
+# always runs, so stopping/skipping still yields a complete report of what exists.
+# rm the file to undo; the next (re)run fills the gap (units are idempotent).
+stopped() { [ -f "$EXPERIMENT_DIR/stop" ]; }
+skipped() { [ -f "$EXPERIMENT_DIR/skip_d$1" ] || [ -f "$EXPERIMENT_DIR/skip_$2" ] || [ -f "$EXPERIMENT_DIR/skip_d$1_$2" ]; }
 # gpus to train on
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 # explicit number of training steps, for debugging (-1 = compute optimal horizon)
@@ -66,8 +80,15 @@ NUM_ITERATIONS="${NUM_ITERATIONS:--1}"
 # extra flags passed verbatim to base_train, e.g. the leaderboard speedrun is:
 #   DEPTHS="24" BASE_TRAIN_FLAGS="--target-param-data-ratio=8 --fp8" bash runs/run.sh speedrun
 BASE_TRAIN_FLAGS="${BASE_TRAIN_FLAGS:-}"
+# examples per CORE task for the final metric (-1 = all; CPU presets cap this)
+CORE_METRIC_MAX_PER_TASK="${CORE_METRIC_MAX_PER_TASK:--1}"
+# the uv dependency extra to sync ("gpu" or "cpu")
+UV_EXTRA="${UV_EXTRA:-gpu}"
 # wandb run name prefix ("dummy" disables wandb logging)
 WANDB_RUN="${WANDB_RUN:-dummy}"
+# optional reference experiment: the final report gains a comparison section
+# (compute multipliers of this experiment over the reference, see scripts/compare.py)
+REFERENCE="${REFERENCE:-}"
 
 # -----------------------------------------------------------------------------
 # Environment: uv, venv, dependencies (idempotent, fast when already set up)
@@ -76,7 +97,7 @@ WANDB_RUN="${WANDB_RUN:-dummy}"
 if [ -z "$SKIP_SETUP" ]; then
     command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
     [ -d ".venv" ] || uv venv
-    uv sync --extra gpu
+    uv sync --extra "$UV_EXTRA"
 fi
 source .venv/bin/activate
 
@@ -114,6 +135,8 @@ if has_stage base; then
 for depth in $DEPTHS; do
     MODEL_DIR="$EXPERIMENT_DIR/d${depth}"
     LOG="$MODEL_DIR/base_train.log"
+    stopped && { echo "stop file present: starting no new work"; break; }
+    skipped "$depth" base && { echo "d${depth}: base skipped (skip file present)"; continue; }
     if grep -q "^summary " "$LOG" 2>/dev/null; then
         echo "d${depth}: base model already trained, skipping"
         continue
@@ -124,7 +147,7 @@ for depth in $DEPTHS; do
         --depth="$depth" \
         --num-iterations="$NUM_ITERATIONS" \
         --core-metric-every=999999 \
-        --core-metric-max-per-task=-1 \
+        --core-metric-max-per-task="$CORE_METRIC_MAX_PER_TASK" \
         --sample-every=-1 \
         --run="$RUN_NAME" \
         $BASE_TRAIN_FLAGS \
@@ -139,6 +162,8 @@ if has_stage infer; then
 for depth in $DEPTHS; do
     MODEL_DIR="$EXPERIMENT_DIR/d${depth}"
     LOG="$MODEL_DIR/infer_bench.log"
+    stopped && { echo "stop file present: starting no new work"; break; }
+    skipped "$depth" infer && { echo "d${depth}: infer skipped (skip file present)"; continue; }
     if grep -q "^summary " "$LOG" 2>/dev/null; then
         echo "d${depth}: inference bench already done, skipping"
         continue
@@ -156,6 +181,8 @@ if has_stage sft; then
 for depth in $DEPTHS; do
     MODEL_DIR="$EXPERIMENT_DIR/d${depth}"
     LOG="$MODEL_DIR/sft.log"
+    stopped && { echo "stop file present: starting no new work"; break; }
+    skipped "$depth" sft && { echo "d${depth}: sft skipped (skip file present)"; continue; }
     if grep -q "^summary " "$LOG" 2>/dev/null; then
         echo "d${depth}: sft already done, skipping"
         continue
@@ -176,6 +203,8 @@ if has_stage chat; then
 for depth in $DEPTHS; do
     MODEL_DIR="$EXPERIMENT_DIR/d${depth}"
     LOG="$MODEL_DIR/chat_eval.log"
+    stopped && { echo "stop file present: starting no new work"; break; }
+    skipped "$depth" chat && { echo "d${depth}: chat eval skipped (skip file present)"; continue; }
     if grep -q "^summary " "$LOG" 2>/dev/null; then
         echo "d${depth}: chat eval already done, skipping"
         continue
@@ -191,3 +220,9 @@ fi
 # This is the product of the experiment: experiments/<name>/curve.log
 
 python -m scripts.curve
+
+# -----------------------------------------------------------------------------
+# Report: render the whole experiment into experiments/<name>/report.md (+ plots),
+# including the comparison vs $REFERENCE if one was given.
+
+python -m scripts.report ${REFERENCE:+--reference "$REFERENCE"}
