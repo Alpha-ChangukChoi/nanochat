@@ -122,40 +122,28 @@ def read_base_summary(experiment_dir, model_tag):
     summary = read_stage_summary(log_path)
     if summary is None or "val_bpb" not in summary:
         return None
-    if "eflops" not in summary:
-        # legacy fallback: logs written before the eflops summary field (Jul 2026)
-        # carry FLOPs/token only as prose; reconstruct total eflops from it
-        flops_per_token = None
-        with open(log_path) as f:
-            for line in f:
-                if line.startswith("Estimated FLOPs per token:"):
-                    flops_per_token = float(line.rsplit(":", 1)[1])
-                    break
-        if flops_per_token is None:
-            return None
-        summary["eflops"] = flops_per_token * summary["tokens_trained"] / 1e18
     return summary
 
 
 def read_training_curve(experiment_dir, model_tag):
-    """
-    The (eflops, val_bpb) points traced by one model's pretraining, from its eval
-    records. Newer logs carry eflops on each eval record; for older ones the mapping
-    is reconstructed from the summary (so an old incomplete run yields no curve).
-    """
+    """The (eflops, val_bpb) points traced by one model's pretraining, from the
+    eval records of its log (each carries the flops spent up to that point)."""
     log_path = os.path.join(experiment_dir, model_tag, "base_train.log")
     records = parse_records(log_path, tag="eval")
     records = [r for r in records if r["step"] > 0] # step 0 is before training: zero flops
-    if any("eflops" not in r for r in records):
-        summary = read_base_summary(experiment_dir, model_tag)
-        if summary is None:
-            return []
-        eflops_per_step = summary["eflops"] / summary["num_iterations"]
-        for record in records:
-            record.setdefault("eflops", record["step"] * eflops_per_step)
     points = [(r["eflops"], r["val_bpb"]) for r in records]
     points = [p for p in points if p[0] > 0] # tiny debug runs can round to eflops=0.0, unusable in log space
     return points
+
+
+def read_bench_sweep(experiment_dir, model_tag):
+    """The per-batch-size `bench` records of one model's inference bench log."""
+    log_path = os.path.join(experiment_dir, model_tag, "infer_bench.log")
+    if not os.path.exists(log_path):
+        return []
+    records = list(parse_records(log_path, tag="bench"))
+    records.sort(key=lambda r: r["batch"])
+    return records
 
 
 if __name__ == "__main__":

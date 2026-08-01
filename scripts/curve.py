@@ -23,7 +23,7 @@ import os
 
 from nanochat.common import get_experiment_dir, get_experiment_name
 from nanochat.logfmt import format_record, parse_records
-from nanochat.experiment import list_model_tags, read_stage_summary
+from nanochat.experiment import list_model_tags, read_stage_summary, read_base_summary
 
 # stage logs to join, in curve column order
 STAGE_LOGS = [
@@ -36,8 +36,13 @@ STAGE_LOGS = [
 def build_row(model_dir, model_tag):
     """Join the stage summaries of one model directory into a flat row."""
     row = {"model_tag": model_tag}
+    experiment_dir = os.path.dirname(model_dir)
     for stage, log_name in STAGE_LOGS:
-        summary = read_stage_summary(os.path.join(model_dir, log_name)) or {}
+        if stage == "base":
+            # read_base_summary additionally checks the run completed (has val_bpb)
+            summary = read_base_summary(experiment_dir, model_tag) or {}
+        else:
+            summary = read_stage_summary(os.path.join(model_dir, log_name)) or {}
         summary.pop("model_tag", None) # identity, already in the row
         if stage == "base" and "depth" in summary:
             row["depth"] = summary.pop("depth")
