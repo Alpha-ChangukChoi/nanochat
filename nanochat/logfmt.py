@@ -64,6 +64,11 @@ def parse_record(line, tag=None):
     or return None if the line is not a well-formed record (or has a different tag).
     """
     line = line.strip()
+    # fast path: when filtering by tag, reject non-matching lines before the
+    # (comparatively slow) shlex split -- a log is mostly step records and prose,
+    # and analysis tools scan many multi-MB logs
+    if tag is not None and not line.startswith(tag + " "):
+        return None
     try:
         tokens = shlex.split(line)
     except ValueError:
