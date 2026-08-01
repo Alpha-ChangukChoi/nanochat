@@ -96,7 +96,7 @@ def main():
     parser.add_argument("-s", "--step", type=int, default=None, help="Step to load (default = last)")
     parser.add_argument("--prompt-tokens", type=int, default=2048, help="Prompt length for prefill")
     parser.add_argument("--decode-tokens", type=int, default=256, help="Tokens to generate per row")
-    parser.add_argument("--batch-sizes", type=str, default="1,8,32,128", help="Comma-separated decode batch sizes")
+    parser.add_argument("--batch-sizes", type=str, default="auto", help="Comma-separated decode batch sizes, or 'auto': double from 1 until OOM")
     parser.add_argument("-t", "--temperature", type=float, default=0.0)
     args = parser.parse_args()
     print(format_invocation(args))
@@ -165,16 +165,26 @@ def main():
     # Measured sweep over batch sizes. Decode reads all weights + KV every step:
     # MBU is the distance from the bandwidth roofline (binds at small batch),
     # MFU the distance from the compute roofline (binds at large batch).
-    batch_sizes = [int(b) for b in args.batch_sizes.split(",")]
+    # "auto" doubles the batch size until the GPU runs out of memory: the OOM is
+    # the natural end of the latency <-> throughput curve (the measured capacity)
+    if args.batch_sizes == "auto":
+        batch_sizes = [2 ** i for i in range(14)] # 1..8192; OOM ends the sweep first
+    else:
+        batch_sizes = [int(b) for b in args.batch_sizes.split(",")]
     bench_records = [] # record lines, printed after the human table
     header = f"{'batch':>6} {'TTFT ms':>9} {'TPOT ms':>9} {'tok/s':>10} {'MBU %':>7} {'MFU %':>7} {'VRAM GiB':>9} {'steps':>6}"
     print(header)
     print("-" * len(header))
     for batch_size in batch_sizes:
-        # warmup (cublas autotune, allocator warm, attention kernels)
-        bench_generate(engine, prompt_tokens, batch_size, 8, args.temperature)
-        # timed run
-        result = bench_generate(engine, prompt_tokens, batch_size, args.decode_tokens, args.temperature)
+        try:
+            # warmup (cublas autotune, allocator warm, attention kernels)
+            bench_generate(engine, prompt_tokens, batch_size, 8, args.temperature)
+            # timed run
+            result = bench_generate(engine, prompt_tokens, batch_size, args.decode_tokens, args.temperature)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            print(f"{batch_size:>6}  out of memory: ending the sweep")
+            break
         step_times = result["step_times"]
         num_steps = len(step_times)
         if num_steps == 0:
