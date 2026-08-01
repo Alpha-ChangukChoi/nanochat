@@ -177,6 +177,9 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     if num_fewshot > 0:
         rng = random.Random(1234 + idx)
         available_indices = [i for i in range(len(data)) if i != idx]
+        # a tiny max_per_task (debug/CPU runs) can leave fewer examples than shots;
+        # degrade to what's available rather than crash (the score is toy anyway)
+        num_fewshot = min(num_fewshot, len(available_indices))
         fewshot_indices = rng.sample(available_indices, num_fewshot)
         fewshot_examples = [data[i] for i in fewshot_indices]
 

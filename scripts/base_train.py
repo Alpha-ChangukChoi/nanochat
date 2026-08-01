@@ -437,7 +437,8 @@ while True:
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(model):
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(format_record("eval", step=step, eflops=round(flops_so_far / 1e18, 4), val_bpb=round(val_bpb, 6)))
+        # 8 decimals so that even tiny CPU-scale runs (~1e-6 EFLOPs/step) stay nonzero
+        print0(format_record("eval", step=step, eflops=round(flops_so_far / 1e18, 8), val_bpb=round(val_bpb, 6)))
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
         wandb_run.log({
@@ -623,7 +624,7 @@ summary = {
     "num_iterations": num_iterations,
     "total_batch_size": total_batch_size,
     "tokens_trained": total_tokens,
-    "eflops": round(total_eflops, 3),
+    "eflops": round(total_eflops, 6), # 6 decimals keeps tiny CPU-scale runs nonzero
     "param_data_ratio": round(total_tokens / num_scaling_params, 2),
     "train_time_sec": round(total_training_time, 1),
     "peak_vram_mib": round(get_max_memory() / 1024 / 1024),
