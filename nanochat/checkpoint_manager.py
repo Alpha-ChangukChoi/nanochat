@@ -81,22 +81,13 @@ def build_model(checkpoint_dir, step, device, phase):
             k: v.float() if v.dtype == torch.bfloat16 else v
             for k, v in model_data.items()
         }
-    # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
+    # Compat: older checkpoints saved from a torch.compile'd module prepend _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
-    with torch.device("meta"):
-        model = GPT(model_config)
-    # Load the model state
-    model.to_empty(device=device)
-    model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
-    model.load_state_dict(model_data, strict=True, assign=True)
-    # Put the model in the right training phase / mode
-    if phase == "eval":
-        model.eval()
-    else:
-        model.train()
+    # Adopt the loaded params directly (validates keys/shapes against the config's schema)
+    model = GPT(model_config, device, params=model_data)
     # Load the Tokenizer
     tokenizer = get_tokenizer()
     # Sanity check: compatibility between model and tokenizer

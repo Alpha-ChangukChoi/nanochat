@@ -19,13 +19,12 @@ import time
 import math
 import argparse
 from dataclasses import asdict
-from contextlib import contextmanager
 
 import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig, Linear
+from nanochat.gpt import GPT, GPTConfig, bf16_matmul, forward as gpt_forward
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.logfmt import format_record, format_invocation
@@ -128,8 +127,8 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-def build_model_meta(depth):
-    """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
+def build_config(depth):
+    """Build a model config for a given depth."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
@@ -140,17 +139,13 @@ def build_model_meta(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
     )
-    with torch.device("meta"):
-        model_meta = GPT(config)
-    return model_meta
+    return config
 
-# Build the model, move to device, init the weights
-model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
-model_config = model.config
+# Build the model: parameters are allocated and initialized directly on the target device
+model_config = build_config(args.depth)
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
-model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
-model.init_weights() # 3) All tensors get initialized
+model = GPT(model_config, device)
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 model_tag = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
@@ -159,92 +154,41 @@ resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
-    model.load_state_dict(model_data, strict=True, assign=True)
-    del model_data # free up this memory after the copy
+    model.load_state_dict(model_data) # replaces the params dict (must happen before setup_optimizer)
+    del model_data # free up this memory
 
 # -----------------------------------------------------------------------------
-# FP8 training initialization and management (this has to be done before torch.compile)
+# FP8 training: choose the matmul that gets threaded into the training forward pass.
+# Evals always run with the default bf16 matmul (more consistent/accurate results),
+# so there is no module swapping to disable FP8 - it's just a different argument.
 
-# Convert Linear layers to Float8Linear if --fp8 is set
+train_matmul = bf16_matmul
 if args.fp8:
     if device_type != "cuda":
         print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
     else:
-        # our custom fp8 is simpler than torchao, written for exact API compatibility
-        from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
-        # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
-        import torch.nn as nn
-
-        # Filter: dims must be divisible by 16 (FP8 hardware requirement) large enough
-        def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
-            if not isinstance(mod, nn.Linear):
-                return False
-            if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
-                return False
-            if min(mod.in_features, mod.out_features) < 128:
-                return False
-            return True
-
-        fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
-        num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
-        convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
-        num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
-        num_skipped = num_linear - num_fp8
-        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
-
-# Context manager to temporarily disable FP8 so that model evaluation remains in BF16
-@contextmanager
-def disable_fp8(model):
-    """Temporarily swap Float8Linear modules with nn.Linear for BF16 evaluation.
-
-    CastConfig is a frozen dataclass, so we can't mutate scaling_type. Instead,
-    we swap out Float8Linear modules entirely and restore them after.
-    """
-    import torch.nn as nn
-
-    # Find all Float8Linear modules and their locations
-    fp8_locations = []  # list of (parent_module, attr_name, fp8_module)
-    for name, module in model.named_modules():
-        if 'Float8' in type(module).__name__:
-            if '.' in name:
-                parent_name, attr_name = name.rsplit('.', 1)
-                parent = model.get_submodule(parent_name)
-            else:
-                parent = model
-                attr_name = name
-            fp8_locations.append((parent, attr_name, module))
-
-    if not fp8_locations:
-        yield  # No FP8 modules, nothing to do
-        return
-
-    # Swap Float8Linear -> Linear (our custom class that casts weights to match input dtype)
-    # Use device="meta" to avoid VRAM spike - the weight tensor will be swapped in afterwards
-    for parent, attr_name, fp8_module in fp8_locations:
-        linear = Linear(
-            fp8_module.in_features,
-            fp8_module.out_features,
-            bias=fp8_module.bias is not None,
-            device="meta",  # Use meta device to avoid unnecessary VRAM allocation
-            dtype=fp8_module.weight.dtype,
-        )
-        linear.weight = fp8_module.weight  # share, don't copy
-        if fp8_module.bias is not None:
-            linear.bias = fp8_module.bias
-        setattr(parent, attr_name, linear)
-
-    try:
-        yield
-    finally:
-        # Restore Float8Linear modules
-        for parent, attr_name, fp8_module in fp8_locations:
-            setattr(parent, attr_name, fp8_module)
+        from nanochat.fp8 import fp8_matmul, check_fp8_dims
+        assert args.fp8_recipe == "tensorwise", "only the 'tensorwise' FP8 recipe is supported (rowwise requires the full torchao library)"
+        assert check_fp8_dims(model_config), "model dims are not FP8-compatible (all matmul dims must be divisible by 16 and >= 128)"
+        train_matmul = fp8_matmul
+        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) for all block matmuls + lm_head (ve_gate stays bf16)")
 
 # -----------------------------------------------------------------------------
-# Compile the model
+# Compile the forward pass used for training and fixed-shape evals. The compiled
+# function and the eager model.forward share the same params dict; evals with
+# varying shapes (CORE, sampling) simply call the eager model directly.
 
-orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+fwd = torch.compile(gpt_forward, dynamic=False) # training inputs never change shape so dynamic=False is safe
+
+def train_forward(x, y):
+    loss = fwd(model.params, x, config=model_config, cos=model.cos, sin=model.sin,
+               targets=y, matmul=train_matmul)
+    return loss
+
+def eval_forward(x, y, loss_reduction='mean'):
+    loss = fwd(model.params, x, config=model_config, cos=model.cos, sin=model.sin,
+               targets=y, loss_reduction=loss_reduction, matmul=bf16_matmul)
+    return loss
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -272,7 +216,7 @@ num_scaling_params = get_scaling_params(model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
-d12_ref = build_model_meta(12) # creates the model on meta device
+d12_ref = GPT(build_config(12), device="meta") # meta device: shapes only, no data, just for param counts
 D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
 B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
 
@@ -432,11 +376,9 @@ while True:
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
-        model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        with disable_fp8(model):
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        val_bpb = evaluate_bpb(eval_forward, val_loader, eval_steps, token_bytes)
         # 8 decimals so that even tiny CPU-scale runs (~1e-6 EFLOPs/step) stay nonzero
         print0(format_record("eval", step=step, eflops=round(flops_so_far / 1e18, 8), val_bpb=round(val_bpb, 6)))
         if val_bpb < min_val_bpb:
@@ -447,16 +389,12 @@ while True:
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
         })
-        model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
-    # use the original uncompiled model because the inputs keep changing shape
-    # disable FP8 for evaluation to use BF16 for more consistent/accurate results
+    # uses the eager model.forward because the inputs keep changing shape (and it's bf16, not FP8)
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
-        model.eval()
-        with disable_fp8(orig_model):
-            results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
+        results = evaluate_core(model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(format_record("core", step=step, core=round(results['core_metric'], 6)))
         wandb_run.log({
             "step": step,
@@ -464,12 +402,10 @@ while True:
             "core_metric": results["core_metric"],
             "centered_results": results["centered_results"],
         })
-        model.train()
 
     # once in a while: sample from the model (only on master process)
-    # use the original uncompiled model because the inputs keep changing shape
+    # uses the eager model.forward because the inputs keep changing shape
     if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
-        model.eval()
         prompts = [
             "The capital of France is",
             "The chemical symbol of gold is",
@@ -479,20 +415,18 @@ while True:
             "My favorite color is",
             "If 5*x + 3 = 13, then x is",
         ]
-        engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+        engine = Engine(model, tokenizer)
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
-            with disable_fp8(orig_model):
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+            sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
-        model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
         save_checkpoint(
             checkpoint_dir,
             step,
-            orig_model.state_dict(), # model parameters
+            model.state_dict(), # model parameters
             optimizer.state_dict(), # optimizer state
             { # metadata saved as json
                 "step": step,
@@ -522,7 +456,7 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        loss = train_forward(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
