@@ -100,6 +100,19 @@ def precompute_rotary_embeddings(seq_len, head_dim, base=100000, device=None):
     cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
     return cos, sin
 
+def init_buffers(config, device):
+    """
+    Non-trainable constants needed by forward, as a flat dict: name -> tensor.
+    Currently just the rotary embedding tables. They are small/cheap in memory, so
+    we over-compute them by 10X the training context (forward asserts if exceeded).
+    Unlike params, buffers are derived from the config and are never checkpointed.
+    """
+    rotary_seq_len = config.sequence_len * 10
+    head_dim = config.n_embd // config.n_head
+    cos, sin = precompute_rotary_embeddings(rotary_seq_len, head_dim, device=device)
+    buffers = {"cos": cos, "sin": sin}
+    return buffers
+
 def compute_window_sizes(config):
     """
     Compute per-layer window sizes for sliding window attention.
@@ -216,13 +229,13 @@ def init_params(config, device):
     return params
 
 
-def forward(params, idx, *, config, cos, sin, targets=None, kv_cache=None, loss_reduction='mean', matmul=bf16_matmul):
+def forward(params, buffers, idx, *, config, targets=None, kv_cache=None, loss_reduction='mean', matmul=bf16_matmul):
     """
-    The GPT forward pass, a pure function of (params, inputs).
+    The GPT forward pass, a pure function of (params, buffers, inputs).
 
-    params: flat dict of name -> Tensor, see init_params
+    params: flat dict of name -> Tensor (trainable), see init_params
+    buffers: flat dict of name -> Tensor (non-trainable constants), see init_buffers
     idx: (B, T) token ids
-    cos, sin: precomputed rotary embeddings, see precompute_rotary_embeddings
     matmul: the function used for all the big Linear matmuls (default bf16, or FP8).
             The tiny ve_gate matmul always runs in bf16 (dims not FP8-compatible).
 
@@ -236,6 +249,7 @@ def forward(params, idx, *, config, cos, sin, targets=None, kv_cache=None, loss_
     window_sizes = compute_window_sizes(config)
 
     # Grab the rotary embeddings for the current sequence positions
+    cos, sin = buffers["cos"], buffers["sin"]
     assert T <= cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {cos.size(1)}"
     assert idx.device == cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {cos.device}"
     # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
@@ -339,17 +353,13 @@ class GPT:
     The shell's forward runs the free function eagerly, which handles varying
     shapes (Engine/KV-cache inference, evals). Training scripts compile this same
     method - fwd = torch.compile(model.forward) - for the fixed-shape hot path:
-    same weights, no split model, and the constants (cos/sin/config) stay internal.
+    same weights, no split model, and the internals (params/buffers/config) stay internal.
     """
 
     def __init__(self, config, device, params=None):
         self.config = config
         self.window_sizes = compute_window_sizes(config)
-        # Rotary embeddings are pretty small/cheap in memory, so we just over-compute
-        # them by 10X, and assert-fail in forward if we ever reach that amount.
-        self.rotary_seq_len = config.sequence_len * 10
-        head_dim = config.n_embd // config.n_head
-        self.cos, self.sin = precompute_rotary_embeddings(self.rotary_seq_len, head_dim, device=device)
+        self.buffers = init_buffers(config, device)
         if params is None:
             self.params = init_params(config, device)
         else:
@@ -366,7 +376,7 @@ class GPT:
                 p.requires_grad_(True)
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', matmul=bf16_matmul):
-        return forward(self.params, idx, config=self.config, cos=self.cos, sin=self.sin,
+        return forward(self.params, self.buffers, idx, config=self.config,
                        targets=targets, kv_cache=kv_cache, loss_reduction=loss_reduction, matmul=matmul)
 
     def __call__(self, *args, **kwargs):
