@@ -33,6 +33,12 @@ def get_checkpoint_dir(model_tag, source):
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
+        # Re-materialize each tensor as a standalone contiguous copy. The live params
+        # are views into the optimizer's flat tapes (see MuonAdamW in optim.py), and
+        # torch.save deduplicates shared storage - saving the views directly would
+        # serialize the whole world_size-dependent tape layout into the file. The
+        # tapes are a runtime optimization; checkpoints must stay independent of them.
+        model_data = {k: v.detach().clone() for k, v in model_data.items()}
         # Save the model state parameters
         model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
         torch.save(model_data, model_path)
