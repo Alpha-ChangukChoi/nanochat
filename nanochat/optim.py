@@ -181,7 +181,10 @@ def muon_step_fused(
 
 # -----------------------------------------------------------------------------
 
-
+# AdamW params smaller than this are all_reduced and updated on every rank (their
+# optimizer state is replicated, but they are tiny: the per-layer scalars).
+# Larger params (the embedding tables, lm_head) are ZeRO-sharded by rows.
+ADAMW_SMALL_NUMEL = 1024
 
 class MuonAdamW(torch.optim.Optimizer):
     """
@@ -302,7 +305,7 @@ class MuonAdamW(torch.optim.Optimizer):
         """Zero the Muon grad stacks in place (the p.grad views stay aliased into
         them) and drop the AdamW grads like a regular set_to_none zero_grad."""
         for group, stack in zip(self.param_groups, self._stacks):
-            if stack is not None:
+            if group['kind'] == 'muon':
                 stack['grad_stack'].zero_()
             else:
                 for p in group['params']:
@@ -311,11 +314,12 @@ class MuonAdamW(torch.optim.Optimizer):
     @torch.no_grad()
     def step(self):
         W, r = self.world_size, self.rank
+        ddp = W > 1 # on a single rank, all communication is skipped
         # Muon grads accumulate directly into the grad stacks because every p.grad is
         # a stack view (set up in __init__). If p.grad were ever reassigned, the reduce
         # below would consume stale gradients, so fail loudly here.
         for group, stack in zip(self.param_groups, self._stacks):
-            if stack is not None:
+            if group['kind'] == 'muon':
                 for j, p in enumerate(group['params']):
                     assert p.grad is not None and p.grad.data_ptr() == stack['grad_stack'][j].data_ptr(), \
                         "Muon p.grad must be its grad-stack view; write gradients in place, don't reassign p.grad"
@@ -325,19 +329,23 @@ class MuonAdamW(torch.optim.Optimizer):
         reduce_works = []  # parallel to param_groups; each entry is a list of works
         for group, stack in zip(self.param_groups, self._stacks):
             works = []
-            if W > 1 and stack is not None:
+            if ddp and group['kind'] == 'muon':
                 k = stack['k']
                 grad_chunk = stack['grad_stack'][r * k:(r + 1) * k]
-                works.append(dist.reduce_scatter_tensor(grad_chunk, stack['grad_stack'], op=dist.ReduceOp.AVG, async_op=True))
-            elif W > 1:
+                work = dist.reduce_scatter_tensor(grad_chunk, stack['grad_stack'], op=dist.ReduceOp.AVG, async_op=True)
+                works.append(work)
+            elif ddp:
                 for p in group['params']:
-                    if p.numel() < 1024:
-                        works.append(dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True))
+                    is_small = p.numel() < ADAMW_SMALL_NUMEL
+                    if is_small:
+                        work = dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True)
+                        works.append(work)
                     else:
                         assert p.shape[0] % W == 0, f"AdamW reduce_scatter requires shape[0] ({p.shape[0]}) divisible by world_size ({W})"
                         rows = p.shape[0] // W
                         grad_slice = p.grad[r * rows:(r + 1) * rows]
-                        works.append(dist.reduce_scatter_tensor(grad_slice, p.grad, op=dist.ReduceOp.AVG, async_op=True))
+                        work = dist.reduce_scatter_tensor(grad_slice, p.grad, op=dist.ReduceOp.AVG, async_op=True)
+                        works.append(work)
             reduce_works.append(works)
 
         # Phase 2: as each group's reduce lands, compute this rank's updates in
@@ -364,7 +372,7 @@ class MuonAdamW(torch.optim.Optimizer):
                     self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
                     group['ns_steps'], red_dim,
                 )
-                if W > 1:
+                if ddp:
                     gather_works.append(dist.all_gather_into_tensor(stack['stack'], param_chunk, async_op=True))
             else:
                 self._adamw_lr_t.fill_(group['lr'])
@@ -373,7 +381,8 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._adamw_eps_t.fill_(group['eps'])
                 self._adamw_wd_t.fill_(group['weight_decay'])
                 for p in group['params']:
-                    if W > 1 and p.numel() >= 1024:
+                    sharded = ddp and p.numel() >= ADAMW_SMALL_NUMEL # ZeRO: each rank updates its slice of rows
+                    if sharded:
                         rows = p.shape[0] // W
                         p_slice = p[r * rows:(r + 1) * rows]
                         grad_slice = p.grad[r * rows:(r + 1) * rows]
@@ -392,7 +401,7 @@ class MuonAdamW(torch.optim.Optimizer):
                         self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
                         self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
                     )
-                    if W > 1 and p.numel() >= 1024:
+                    if sharded:
                         gather_works.append(dist.all_gather_into_tensor(p, p_slice, async_op=True))
 
         # Phase 3: wait for the gathers. Params alias the gathered storage
