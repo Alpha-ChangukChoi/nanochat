@@ -199,7 +199,8 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
 
     # Reproducibility
     # Note that we set the global seeds here, but most of the code uses explicit rng objects.
-    # The only place where global rng might be used is nn.Module initialization of the model weights.
+    # The only place where the global rng is used is init_params() in gpt.py initializing
+    # the model weights (which makes the init reproducible for a fixed seed).
     torch.manual_seed(42)
     if device_type == "cuda":
         torch.cuda.manual_seed(42)
