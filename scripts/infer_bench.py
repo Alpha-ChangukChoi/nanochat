@@ -107,7 +107,7 @@ def main():
     assert ddp_world_size == 1, "infer_bench is a single GPU benchmark, run without torchrun"
 
     model_tag = args.model_tag if args.model_tag is not None else find_largest_model(args.source)
-    model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=model_tag, step=args.step)
+    model, tokenizer, meta = load_model(args.source, device, model_tag=model_tag, step=args.step)
     config = model.config
     engine = Engine(model, tokenizer)
 

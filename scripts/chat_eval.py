@@ -198,7 +198,7 @@ if __name__ == "__main__":
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 
     model_tag = args.model_tag if args.model_tag is not None else find_largest_model(args.source)
-    model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=model_tag, step=args.step)
+    model, tokenizer, meta = load_model(args.source, device, model_tag=model_tag, step=args.step)
     engine = Engine(model, tokenizer)
 
     # Get the tasks to evaluate on

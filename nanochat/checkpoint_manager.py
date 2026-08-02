@@ -75,7 +75,7 @@ def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     return model_data, optimizer_data, meta_data
 
 
-def build_model(checkpoint_dir, step, device, phase):
+def build_model(checkpoint_dir, step, device):
     """
     A bunch of repetitive code to build a model from a given checkpoint.
     Returns:
@@ -83,7 +83,6 @@ def build_model(checkpoint_dir, step, device, phase):
     - tokenizer
     - meta data saved during base model training
     """
-    assert phase in ["train", "eval"], f"Invalid phase: {phase}"
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, step, device, load_optimizer=False)
     if device.type in {"cpu", "mps"}:
         # Convert bfloat16 tensors to float for CPU inference
@@ -91,8 +90,6 @@ def build_model(checkpoint_dir, step, device, phase):
             k: v.float() if v.dtype == torch.bfloat16 else v
             for k, v in model_data.items()
         }
-    # Compat: older checkpoints saved from a torch.compile'd module prepend _orig_mod.
-    model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
@@ -139,7 +136,7 @@ def find_last_step(checkpoint_dir):
 # -----------------------------------------------------------------------------
 # convenience functions that take into account nanochat's directory structure
 
-def load_model(source, device, phase, model_tag=None, step=None):
+def load_model(source, device, model_tag=None, step=None):
     if model_tag is None:
         # guess the model tag by defaulting to the largest model in the experiment
         model_tag = find_largest_model(source)
@@ -151,7 +148,7 @@ def load_model(source, device, phase, model_tag=None, step=None):
     assert step is not None, f"No checkpoints found in {checkpoint_dir}"
     # build the model
     log0(f"Loading model from {checkpoint_dir} with step {step}")
-    model, tokenizer, meta_data = build_model(checkpoint_dir, step, device, phase)
+    model, tokenizer, meta_data = build_model(checkpoint_dir, step, device)
     return model, tokenizer, meta_data
 
 def load_optimizer_state(source, device, rank, model_tag=None, step=None):

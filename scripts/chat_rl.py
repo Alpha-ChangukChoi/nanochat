@@ -71,7 +71,7 @@ use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl", name=args.run, config=user_config)
 
 # Init model and tokenizer
-model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)
+model, tokenizer, meta = load_model("sft", device, model_tag=args.model_tag, step=args.model_step)
 engine = Engine(model, tokenizer) # for sampling rollouts
 
 # -----------------------------------------------------------------------------
@@ -97,7 +97,6 @@ def get_batch():
         prefix_length = len(tokens)
 
         # Generate num_samples samples using batched generation, use loop to avoid OOMs
-        model.eval() # ensure the model is in eval mode
         generated_token_sequences = []
         masks = []
         num_sampling_steps = args.num_samples // args.device_batch_size # go sequentially to prevent OOMs
@@ -223,7 +222,6 @@ for step in range(num_steps):
 
     # Evaluate the model once in a while and log to wandb
     if step % args.eval_every == 0:
-        model.eval()
         passk = torch.zeros(args.device_batch_size, device=device) # pass@k for k=1..device_batch_size
         records_iter = run_gsm8k_eval(val_task, tokenizer, engine, num_samples=args.device_batch_size, max_examples=args.eval_examples, temperature=1.0)
         records = list(records_iter) # collect all records
@@ -249,7 +247,6 @@ for step in range(num_steps):
         # Get one batch corresponding to one example in the training dataset
         sequences_all, inputs_all, targets_all, rewards_all, advantages_all = next(batch_iterator)
         # Evaluate the loss and gradients
-        model.train() # ensure the model is in train mode
         # We need one more loop because we can never exceed the device_batch_size
         assert inputs_all.size(0) % args.device_batch_size == 0
         num_passes = inputs_all.size(0) // args.device_batch_size

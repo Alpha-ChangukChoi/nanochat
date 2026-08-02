@@ -303,7 +303,7 @@ if __name__ == "__main__":
     device_type = autodetect_device_type()
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
     # load the model and tokenizer
-    model, tokenizer, meta = load_model("base", device, phase="eval")
+    model, tokenizer, meta = load_model("base", device)
     bos_token_id = tokenizer.get_bos_token_id()
     # common hyperparameters
     kwargs = dict(max_tokens=64, temperature=0.0)

@@ -207,15 +207,3 @@ def fp8_matmul(x, w):
     out_2d = _Float8Matmul.apply(x_2d, w)
     out = out_2d.reshape(*orig_shape[:-1], out_2d.shape[-1])
     return out
-
-
-def check_fp8_dims(config):
-    """FP8 hardware requires all matmul dims divisible by 16; tiny dims aren't worth it.
-    Returns True if all the big Linear matmuls of the model qualify (the ve_gate
-    matmul is excluded — the forward pass always runs it in bf16)."""
-    from nanochat.gpt import padded_vocab_size # avoid circular import at module load
-    head_dim = config.n_embd // config.n_head
-    kv_dim = config.n_kv_head * head_dim
-    dims = [config.n_embd, 4 * config.n_embd, kv_dim, padded_vocab_size(config.vocab_size)]
-    ok = all(d % 16 == 0 for d in dims) and min(dims) >= 128
-    return ok

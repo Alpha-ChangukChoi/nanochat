@@ -141,21 +141,22 @@ def build_config(depth):
     )
     return config
 
-# Build the model: parameters are allocated and initialized directly on the target device
 model_config = build_config(args.depth)
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
-model = GPT(model_config, device)
 
-# If we are resuming, overwrite the model parameters with those of the checkpoint
+# If we are resuming, the model parameters come from the checkpoint instead of a fresh init
 model_tag = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = get_checkpoint_dir(model_tag, "base") # e.g. experiments/<name>/d12/base
 resuming = args.resume_from_step != -1
+model_data = None
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
-    model.load_state_dict(model_data) # replaces the params dict (must happen before setup_optimizer)
-    del model_data # free up this memory
+
+# Build the model: parameters are allocated (or adopted from the checkpoint) directly on the target device
+model = GPT(model_config, device, params=model_data)
+del model_data # the params are now owned by the model
 
 # -----------------------------------------------------------------------------
 # FP8 training: choose the matmul that gets threaded into the training forward pass.
@@ -167,9 +168,13 @@ if args.fp8:
     if device_type != "cuda":
         print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
     else:
-        from nanochat.fp8 import fp8_matmul, check_fp8_dims
+        from nanochat.fp8 import fp8_matmul
         assert args.fp8_recipe == "tensorwise", "only the 'tensorwise' FP8 recipe is supported (rowwise requires the full torchao library)"
-        assert check_fp8_dims(model_config), "model dims are not FP8-compatible (all matmul dims must be divisible by 16 and >= 128)"
+        # FP8 hardware wants all matmul dims divisible by 16 and not tiny. Every big matmul
+        # dim is a multiple of head_dim or of the 64-padded vocab, so this check covers them
+        # (the tiny ve_gate matmul always stays bf16 in the forward pass).
+        head_dim = model_config.n_embd // model_config.n_head
+        assert head_dim % 16 == 0 and model_config.n_embd >= 128, "model dims are not FP8-compatible"
         train_matmul = fp8_matmul
         print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) for all block matmuls + lm_head (ve_gate stays bf16)")
 

@@ -24,7 +24,7 @@ args = parser.parse_args()
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
+model, tokenizer, meta = load_model(args.source, device, model_tag=args.model_tag, step=args.step)
 
 # Special tokens for the chat state machine
 bos = tokenizer.get_bos_token_id()

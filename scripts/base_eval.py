@@ -148,7 +148,7 @@ def main():
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
     # Load model and tokenizer
     model_tag = args.model_tag if args.model_tag is not None else find_largest_model("base")
-    model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=model_tag, step=args.step)
+    model, tokenizer, meta = load_model("base", device, model_tag=model_tag, step=args.step)
     sequence_len = meta["model_config"]["sequence_len"]
     token_bytes = get_token_bytes(device=device)
     model_name = f"{model_tag} base model (step {meta['step']})"
