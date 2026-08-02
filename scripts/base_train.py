@@ -485,7 +485,7 @@ while True:
         scaler.update()
     else:
         optimizer.step()
-    model.zero_grad(set_to_none=True)
+    optimizer.zero_grad() # zeroes the flat grad tapes in place (do NOT sever p.grad views)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()

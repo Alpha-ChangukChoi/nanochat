@@ -181,74 +181,56 @@ def muon_step_fused(
 
 # -----------------------------------------------------------------------------
 
+
 class MuonAdamW(torch.optim.Optimizer):
     """
-    Combined optimizer: Muon for 2D matrix params, AdamW for others.
+    Combined optimizer: Muon for 2D matrix params, AdamW for others, built around
+    flat parameter/gradient tapes ("flat theta").
 
-    AdamW - Fused AdamW optimizer step.
+    At construction, every parameter is re-housed as a view into one of a few large
+    contiguous tapes (p.data = tape_view), and every p.grad is pre-bound as a view
+    into a matching flat gradient tape, so autograd accumulates gradients directly
+    into the tapes. One optimizer step is then just a handful of tape-level
+    collectives instead of one or two per parameter:
 
-    Muon - MomentUm Orthogonalized by Newton-schulz
-    https://kellerjordan.github.io/posts/muon/
+        Muon tape (one, fp32):     reduce_scatter(grad) -> update own chunk -> all_gather(theta)
+        AdamW tapes (one/dtype):   reduce_scatter(grad) -> update own chunk -> all_gather(theta)
 
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
+    All collectives run in place (NCCL's documented in-place semantics: the chunk
+    is a view into the tape at rank*chunk), so there is no torch.stack on the way
+    in and no copy-back on the way out - the params ARE the tape.
 
-    Some warnings:
-    - The Muon optimizer should not be used for the embedding layer, the final fully connected layer,
-    or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
-    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
+    There are multiple tapes, not one, because dtypes can't mix in a flat tensor
+    (embeddings are bf16, matrices fp32) and because Muon and AdamW shard on
+    different atoms:
 
-    The same class covers single GPU and distributed training. In the distributed setting
-    (a multi-rank process group is initialized), gradients are synchronized here in the
-    optimizer (nanochat does not use DDP) and optimizer states are sharded across ranks
-    (ZeRO-2 style). On a single rank, all communication is skipped and the rank owns all
-    parameters, so the sharded code paths degenerate to plain full-tensor updates.
+    - Muon's atom is a whole matrix (it cannot orthogonalize part of one), so the
+      Muon tape is laid out rank-major: [rank0's bundle | rank1's bundle | ...],
+      each bundle holding the same number of whole matrices of every "size class".
+      A single equal-chunk reduce_scatter then hands every rank contiguous runs of
+      whole matrices that view directly as (K, m, n) stacks for the fused kernel.
+      Groups whose matrices have equal numel (e.g. mlp c_fc (4n, n) and c_proj
+      (n, 4n)) pool into one size class, which makes the per-rank count come out
+      even where per-shape counts would not - no zero-padding at any default depth.
+      Leftover blocks are padded with all-zero dummy matrices (Muon's update of a
+      zero matrix is zero, so they ride along harmlessly).
 
-    Design Goals:
-    - Overlap communication with computation (async ops)
-    - Minimize memory by sharding optimizer states across ranks (ZeRO-2 style)
-    - Batch small tensors into single comm ops where possible
+    - AdamW's atom is an element, so its tapes are laid out param-major and the
+      equal chunks may cut anywhere - mid-row, mid-tensor. Each rank applies the
+      right group hyperparameters to the sub-segments of its chunk (ZeRO-2:
+      exp_avg/exp_avg_sq exist only for the local chunk).
 
-    Communication Pattern (3-phase async):
-    We use a 3-phase structure to maximize overlap between communication and compute:
+    The tape layout depends on world_size, so it is a runtime detail of the
+    optimizer: checkpoints save the ordinary name -> tensor dict (the model) and
+    this rank's chunk-sized optimizer state; resuming requires the same world_size.
 
-        Phase 1: Launch all async reduce ops
-            - Kick off all reduce_scatter/all_reduce operations
-            - Don't wait - let them run in background while we continue
+    On a single rank (no process group) all communication is skipped and the
+    "chunk" is the whole tape - Muon still gets stack-free (K, m, n) views.
 
-        Phase 2: Wait for reduces, compute updates, launch gathers
-            - For each group: wait for its reduce, compute the update, launch gather
-            - By processing groups in order, earlier gathers run while later computes happen
-
-        Phase 3: Wait for gathers, copy back
-            - Wait for all gathers to complete
-            - Copy updated params back to original tensors (Muon only)
-
-    AdamW Communication (ZeRO-2 style):
-    - Small params (<1024 elements): all_reduce gradients, update full param on each rank.
-      Optimizer state is replicated but these params are tiny (scalars, biases).
-    - Large params: reduce_scatter gradients so each rank gets 1/N of the grad, update
-      only that slice, then all_gather the updated slices. Optimizer state (exp_avg,
-      exp_avg_sq) is sharded - each rank only stores state for its slice.
-      Requires param.shape[0] divisible by world_size.
-
-    Muon Communication (stacked + chunked):
-    - All params in a Muon group must have the same shape (caller's responsibility).
-    - Stack all K params into a single (K, *shape) tensor for efficient comm.
-    - Divide K params across N ranks: each rank "owns" ceil(K/N) params.
-    - reduce_scatter the stacked grads so each rank gets its chunk.
-    - Each rank computes Muon update only for params it owns.
-    - all_gather the updated params back to all ranks.
-    - Optimizer state (momentum_buffer, second_momentum_buffer) is sharded by chunk.
-    - Padding: if K doesn't divide evenly, we zero-pad to (ceil(K/N) * N) for comm,
-      then ignore the padding when copying back.
-
-    Buffer Reuse:
-    - For Muon, we allocate stacked_grads for reduce_scatter input, then reuse the
-      same buffer as the output for all_gather (stacked_params). This saves memory
-      since we don't need both buffers simultaneously.
+    The p.grad tape aliasing is an optimization, not a correctness requirement:
+    step() re-adopts any gradient that was severed from the tape (e.g. by an
+    external p.grad assignment) before reducing. Use this optimizer's zero_grad(),
+    which zeroes the tapes and preserves the aliasing.
 
     Arguments:
         param_groups: List of dicts, each containing:
@@ -256,9 +238,11 @@ class MuonAdamW(torch.optim.Optimizer):
             - 'kind': 'adamw' or 'muon'
             - For AdamW groups: 'lr', 'betas', 'eps', 'weight_decay'
             - For Muon groups: 'lr', 'momentum', 'ns_steps', 'beta2', 'weight_decay'
+        All params in a Muon group must have the same shape (caller's responsibility).
     """
     def __init__(self, param_groups: list[dict]):
         super().__init__(param_groups, defaults={})
+        assert all(g['kind'] in ('adamw', 'muon') for g in self.param_groups), "unknown optimizer kind"
         # 0-D CPU tensors to avoid torch.compile recompilation when values change
         self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
@@ -270,190 +254,252 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        # The tape layout is a function of world size, decided once at construction
+        if dist.is_available() and dist.is_initialized():
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+        else:
+            self.rank = 0
+            self.world_size = 1
+        self._grad_views = {}  # param -> its pre-bound view into a grad tape
+        self._grad_tapes = []
+        self._build_muon_tape()
+        self._build_adamw_tapes()
 
-    def _reduce_adamw(self, group: dict, world_size: int) -> dict:
-        """Launch async reduce ops for AdamW group. Returns info dict with per-param infos."""
-        param_infos = {}
-        for p in group['params']:
+    def _build_muon_tape(self):
+        """Lay out all Muon params in one rank-major tape of whole matrices."""
+        W, r = self.world_size, self.rank
+        # Note: groups are referenced by INDEX into self.param_groups, never by dict
+        # reference - load_state_dict() replaces the group dicts, and the scheduler
+        # mutates the new ones, so a captured reference would read stale hyperparams.
+        muon_groups = [(gi, g) for gi, g in enumerate(self.param_groups) if g['kind'] == 'muon']
+        self._muon = None
+        if not muon_groups:
+            return
+        for _, group in muon_groups:
+            shapes = {p.shape for p in group['params']}
+            assert len(shapes) == 1, "all params in a Muon group must share one shape"
+
+        # Partition the matrices into size classes by per-matrix numel. Same-numel
+        # groups pool their counts, so the blocks divide more evenly across ranks.
+        classes = {}  # per-matrix numel -> list of (group_idx, param) in group order
+        for gi, group in muon_groups:
+            for p in group['params']:
+                classes.setdefault(p.numel(), []).append((gi, p))
+
+        # Bundle layout: every rank's bundle holds k_c whole matrices of class c
+        # (k_c = ceil(K_c / W); the last slots may be all-zero dummy blocks)
+        bundle = 0
+        class_infos = []
+        for numel, blocks in classes.items():
+            k = -(-len(blocks) // W)  # ceil division
+            class_infos.append(dict(numel=numel, blocks=blocks, K=len(blocks), k=k, class_offset=bundle))
+            bundle += k * numel
+
+        p0 = muon_groups[0][1]['params'][0]
+        dtype, device = p0.dtype, p0.device
+        assert all(p.dtype == dtype for _, g in muon_groups for p in g['params']), "Muon params must share one dtype"
+        theta = torch.zeros(W * bundle, dtype=dtype, device=device)  # zeros: dummy blocks stay zero forever
+        grad_tape = torch.zeros_like(theta)
+
+        # Re-house every param and its grad as views into the tapes
+        for ci in class_infos:
+            for j, (gi, p) in enumerate(ci['blocks']):
+                owner, slot = divmod(j, ci['k'])
+                offset = owner * bundle + ci['class_offset'] + slot * ci['numel']
+                theta_view = theta[offset:offset + ci['numel']].view_as(p)
+                theta_view.copy_(p.detach())
+                p.data = theta_view  # p now aliases the tape (same Python object everywhere)
+                p.grad = grad_tape[offset:offset + ci['numel']].view_as(p)
+                self._grad_views[p] = p.grad
+
+        # This rank's compute plan: contiguous per-group runs of whole matrices
+        # inside our bundle, each viewable as a (count, m, n) stack. Dummy padding
+        # blocks are attached to the last real run of their class.
+        subruns = []  # dicts: gidx (into param_groups), count, start (absolute tape offset), shape
+        for ci in class_infos:
+            runs = []  # [group_idx, count]
+            for j in range(r * ci['k'], (r + 1) * ci['k']):
+                gi = ci['blocks'][min(j, ci['K'] - 1)][0]  # dummies -> last real block's group
+                if runs and runs[-1][0] == gi:
+                    runs[-1][1] += 1
+                else:
+                    runs.append([gi, 1])
+            slot = 0
+            for gi, count in runs:
+                start = r * bundle + ci['class_offset'] + slot * ci['numel']
+                shape = self.param_groups[gi]['params'][0].shape
+                subruns.append(dict(gidx=gi, count=count, start=start, shape=shape, numel=count * ci['numel']))
+                slot += count
+
+        # Persistent optimizer state, sharded: only this rank's shard exists here.
+        # Keyed under an anchor param so torch's state_dict/load_state_dict work.
+        second_momentum = []
+        for sr in subruns:
+            m, n = sr['shape'][-2], sr['shape'][-1]
+            state_shape = (sr['count'], m, 1) if m >= n else (sr['count'], 1, n)
+            second_momentum.append(torch.zeros(state_shape, dtype=dtype, device=device))
+        self.state[p0] = dict(
+            momentum_tape=torch.zeros(bundle, dtype=dtype, device=device),
+            second_momentum=second_momentum,
+        )
+        self._grad_tapes.append(grad_tape)
+        # a rank's bundle is exactly its collective chunk, so store it as 'chunk' like the AdamW tapes
+        self._muon = dict(theta=theta, grad_tape=grad_tape, chunk=bundle, subruns=subruns, anchor=p0)
+
+    def _build_adamw_tapes(self):
+        """Lay out AdamW params in one param-major tape per dtype, sharded elementwise."""
+        W, r = self.world_size, self.rank
+        self._adamw_tapes = []
+        by_dtype = {}  # dtype -> list of (group_idx, param) in group order
+        for gi, group in enumerate(self.param_groups):
+            if group['kind'] != 'adamw':
+                continue
+            for p in group['params']:
+                by_dtype.setdefault(p.dtype, []).append((gi, p))
+        for dtype, blocks in by_dtype.items():
+            device = blocks[0][1].device
+            total = sum(p.numel() for _, p in blocks)
+            padded = -(-total // W) * W  # pad with a few zero dummy elements so W divides the tape
+
+            theta = torch.zeros(padded, dtype=dtype, device=device)
+            grad_tape = torch.zeros_like(theta)
+            offset = 0
+            intervals = []  # (group_idx, start, end) per param, in tape order
+            for gi, p in blocks:
+                theta_view = theta[offset:offset + p.numel()].view_as(p)
+                theta_view.copy_(p.detach())
+                p.data = theta_view
+                p.grad = grad_tape[offset:offset + p.numel()].view_as(p)
+                self._grad_views[p] = p.grad
+                intervals.append((gi, offset, offset + p.numel()))
+                offset += p.numel()
+
+            # This rank's segments: our chunk intersected with each param's interval,
+            # merged where neighbors share a group. AdamW is elementwise, so the
+            # chunk cuts may fall anywhere - mid-row, mid-tensor.
+            chunk = padded // W
+            chunk_start, chunk_end = r * chunk, (r + 1) * chunk
+            segments = []  # [group_idx, start, end] in absolute tape offsets
+            for gi, a, b in intervals:
+                a, b = max(a, chunk_start), min(b, chunk_end)
+                if a >= b:
+                    continue
+                if segments and segments[-1][0] == gi and segments[-1][2] == a:
+                    segments[-1][2] = b
+                else:
+                    segments.append([gi, a, b])
+
+            anchor = blocks[0][1]
+            self.state[anchor] = dict(
+                step=0,
+                exp_avg=torch.zeros(chunk, dtype=dtype, device=device),
+                exp_avg_sq=torch.zeros(chunk, dtype=dtype, device=device),
+            )
+            self._grad_tapes.append(grad_tape)
+            self._adamw_tapes.append(dict(theta=theta, grad_tape=grad_tape, chunk=chunk, segments=segments, anchor=anchor))
+
+    def _ensure_grad_views(self):
+        """
+        Normally autograd accumulates directly into the grad tapes because every
+        p.grad was pre-bound as a tape view at construction. If the aliasing was
+        severed (external p.grad assignment or set_to_none), adopt the values into
+        the tape and restore the view so the reduce always sees the real gradients.
+        """
+        for p, view in self._grad_views.items():
             grad = p.grad
-            if world_size == 1:
-                # Single rank: no communication, update the full param in place
-                param_infos[p] = dict(future=None, grad_slice=grad, is_small=True)
-            elif p.numel() < 1024:
-                # Small params: all_reduce (no scatter/gather needed)
-                future = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
-                param_infos[p] = dict(future=future, grad_slice=grad, is_small=True)
-            else:
-                # Large params: reduce_scatter
-                assert grad.shape[0] % world_size == 0, f"AdamW reduce_scatter requires shape[0] ({grad.shape[0]}) divisible by world_size ({world_size})"
-                rank_size = grad.shape[0] // world_size
-                grad_slice = torch.empty_like(grad[:rank_size])
-                future = dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
-                param_infos[p] = dict(future=future, grad_slice=grad_slice, is_small=False)
-        return dict(param_infos=param_infos)
+            if grad is None:
+                view.zero_()
+            elif grad.data_ptr() != view.data_ptr():
+                view.copy_(grad)
+            p.grad = view
 
-    def _reduce_muon(self, group: dict, world_size: int) -> dict:
-        """Launch async reduce op for Muon group. Returns info dict."""
-        params = group['params']
-        if world_size == 1:
-            # Single rank: this rank owns all params, the stacked grads are the "chunk"
-            grad_chunk = torch.stack([p.grad for p in params])
-            return dict(future=None, grad_chunk=grad_chunk, stacked_grads=None, chunk_size=len(params))
-        chunk_size = (len(params) + world_size - 1) // world_size
-        padded_num_params = chunk_size * world_size
-        p = params[0]
-        shape, device, dtype = p.shape, p.device, p.dtype
+    def zero_grad(self, set_to_none=True):
+        """Zero the flat grad tapes (a few big memsets) and keep the p.grad aliasing."""
+        for tape in self._grad_tapes:
+            tape.zero_()
+        for p, view in self._grad_views.items():
+            p.grad = view
 
-        # Stack grads and zero-pad to padded_num_params
-        grad_stack = torch.stack([p.grad for p in params])
-        stacked_grads = torch.empty(padded_num_params, *shape, dtype=dtype, device=device)
-        stacked_grads[:len(params)].copy_(grad_stack)
-        if len(params) < padded_num_params:
-            stacked_grads[len(params):].zero_()
+    def _step_muon(self):
+        """Muon updates for the matrices this rank owns, in place in the param tape."""
+        t = self._muon
+        state = self.state[t['anchor']]
+        momentum_tape = state['momentum_tape']
+        bundle_start = self.rank * t['chunk']
+        for i, sr in enumerate(t['subruns']):
+            group = self.param_groups[sr['gidx']] # by index: load_state_dict replaces the group dicts
+            count, shape = sr['count'], sr['shape']
+            start, numel = sr['start'], sr['numel']
+            grads = t['grad_tape'][start:start + numel].view(count, *shape)
+            params_stack = t['theta'][start:start + numel].view(count, *shape)
+            momentum = momentum_tape[start - bundle_start:start - bundle_start + numel].view(count, *shape)
+            red_dim = -1 if shape[-2] >= shape[-1] else -2
+            self._muon_momentum_t.fill_(group['momentum'])
+            self._muon_beta2_t.fill_(group['beta2'])
+            self._muon_lr_t.fill_(group['lr'] * max(1.0, shape[-2] / shape[-1]) ** 0.5)
+            self._muon_wd_t.fill_(group['weight_decay'])
+            muon_step_fused(
+                grads, params_stack, momentum, state['second_momentum'][i],
+                self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+                group['ns_steps'], red_dim,
+            )
 
-        # Reduce_scatter to get this rank's chunk
-        grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
-        future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
-
-        return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
-
-    def _compute_adamw(self, group: dict, info: dict, gather_list: list, rank: int, world_size: int) -> None:
-        """Wait for reduce, compute AdamW updates, launch gathers for large params."""
-        param_infos = info['param_infos']
-        for p in group['params']:
-            pinfo = param_infos[p]
-            if pinfo['future'] is not None:
-                pinfo['future'].wait()
-            grad_slice = pinfo['grad_slice']
-            state = self.state[p]
-
-            # For small params, operate on full param; for large, operate on slice
-            if pinfo['is_small']:
-                p_slice = p
-            else:
-                rank_size = p.shape[0] // world_size
-                p_slice = p[rank * rank_size:(rank + 1) * rank_size]
-
-            # State init
-            if not state:
-                state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(p_slice)
-                state['exp_avg_sq'] = torch.zeros_like(p_slice)
-            state['step'] += 1
-
-            # Fill 0-D tensors and run fused kernel
-            self._adamw_step_t.fill_(state['step'])
+    def _step_adamw(self, t):
+        """AdamW updates for this rank's chunk of one tape, segment by segment."""
+        state = self.state[t['anchor']]
+        state['step'] += 1
+        self._adamw_step_t.fill_(state['step'])
+        chunk_start = self.rank * t['chunk']
+        for gi, a, b in t['segments']:
+            group = self.param_groups[gi] # by index: load_state_dict replaces the group dicts
             self._adamw_lr_t.fill_(group['lr'])
             self._adamw_beta1_t.fill_(group['betas'][0])
             self._adamw_beta2_t.fill_(group['betas'][1])
             self._adamw_eps_t.fill_(group['eps'])
             self._adamw_wd_t.fill_(group['weight_decay'])
             adamw_step_fused(
-                p_slice, grad_slice, state['exp_avg'], state['exp_avg_sq'],
+                t['theta'][a:b], t['grad_tape'][a:b],
+                state['exp_avg'][a - chunk_start:b - chunk_start],
+                state['exp_avg_sq'][a - chunk_start:b - chunk_start],
                 self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
                 self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
             )
 
-            # Large params need all_gather
-            if not pinfo['is_small']:
-                future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
-                gather_list.append(dict(future=future, params=None))
-
-    def _compute_muon(self, group: dict, info: dict, gather_list: list, rank: int) -> None:
-        """Wait for reduce, compute Muon updates, launch gather."""
-        if info['future'] is not None:
-            info['future'].wait()
-        params = group['params']
-        chunk_size = info['chunk_size']
-        grad_chunk = info['grad_chunk']
-        p = params[0]
-        shape, device, dtype = p.shape, p.device, p.dtype
-
-        # How many params does this rank own?
-        start_idx = rank * chunk_size
-        num_owned = min(chunk_size, max(0, len(params) - start_idx))
-
-        # Get or create group-level state
-        state = self.state[p]
-        if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
-            state_shape = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
-
-        stacked_owned = None
-        if num_owned > 0:
-            owned_params = [params[start_idx + i] for i in range(num_owned)]
-            stacked_owned = torch.stack(owned_params)
-
-            # Fill 0-D tensors and run fused kernel
-            self._muon_momentum_t.fill_(group["momentum"])
-            self._muon_beta2_t.fill_(group["beta2"])
-            self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
-            self._muon_wd_t.fill_(group["weight_decay"])
-            muon_step_fused(
-                grad_chunk[:num_owned], stacked_owned,
-                state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
-                self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
-                group["ns_steps"], red_dim,
-            )
-
-        if info['stacked_grads'] is None:
-            # Single rank: no gather needed, the updated stack maps directly onto the params
-            gather_list.append(dict(future=None, stacked_params=stacked_owned, params=params))
-            return
-
-        # Build the input buffer for all_gather
-        updated_params = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
-        if num_owned > 0:
-            updated_params[:num_owned].copy_(stacked_owned)
-        if num_owned < chunk_size:
-            updated_params[num_owned:].zero_()
-
-        # Reuse stacked_grads buffer for all_gather output
-        stacked_params = info["stacked_grads"]
-        future = dist.all_gather_into_tensor(stacked_params, updated_params, async_op=True).get_future()
-        gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
-
-    def _finish_gathers(self, gather_list: list) -> None:
-        """Wait for all gathers and copy Muon params back."""
-        for info in gather_list:
-            if info["future"] is not None:
-                info["future"].wait()
-            if info["params"] is not None:
-                # Muon: copy from stacked buffer back to individual params
-                torch._foreach_copy_(info["params"], list(info["stacked_params"][:len(info["params"])].unbind(0)))
-
     @torch.no_grad()
     def step(self):
-        # On a single rank (no multi-rank process group), all communication is skipped
-        if dist.is_available() and dist.is_initialized():
-            rank = dist.get_rank()
-            world_size = dist.get_world_size()
-        else:
-            rank = 0
-            world_size = 1
+        W, r = self.world_size, self.rank
+        self._ensure_grad_views()
 
-        # Phase 1: launch all async reduce ops
-        reduce_infos: list[dict] = []
-        for group in self.param_groups:
-            if group['kind'] == 'adamw':
-                reduce_infos.append(self._reduce_adamw(group, world_size))
-            elif group['kind'] == 'muon':
-                reduce_infos.append(self._reduce_muon(group, world_size))
+        # Phase 1: launch all async reduce_scatters, in place (output chunk is a view
+        # into the grad tape). NCCL executes them in launch order, so the Muon tape -
+        # whose update compute is the heaviest - goes first.
+        tapes = ([self._muon] if self._muon is not None else []) + self._adamw_tapes
+        reduces = []
+        if W > 1:
+            for t in tapes:
+                chunk = t['chunk']
+                grad_chunk = t['grad_tape'][r * chunk:(r + 1) * chunk]
+                work = dist.reduce_scatter_tensor(grad_chunk, t['grad_tape'], op=dist.ReduceOp.AVG, async_op=True)
+                reduces.append(work)
+
+        # Phase 2: as each reduce lands, compute this rank's updates in place in the
+        # param tape, then launch the in-place all_gather that rebroadcasts them.
+        gathers = []
+        for i, t in enumerate(tapes):
+            if W > 1:
+                reduces[i].wait()
+            if t is self._muon:
+                self._step_muon()
             else:
-                raise ValueError(f"Unknown optimizer kind: {group['kind']}")
+                self._step_adamw(t)
+            if W > 1:
+                chunk = t['chunk']
+                theta_chunk = t['theta'][r * chunk:(r + 1) * chunk]
+                work = dist.all_gather_into_tensor(t['theta'], theta_chunk, async_op=True)
+                gathers.append(work)
 
-        # Phase 2: wait for reduces, compute updates, launch gathers
-        gather_list: list[dict] = []
-        for group, info in zip(self.param_groups, reduce_infos):
-            if group['kind'] == 'adamw':
-                self._compute_adamw(group, info, gather_list, rank, world_size)
-            elif group['kind'] == 'muon':
-                self._compute_muon(group, info, gather_list, rank)
-            else:
-                raise ValueError(f"Unknown optimizer kind: {group['kind']}")
-
-        # Phase 3: wait for gathers, copy back
-        self._finish_gathers(gather_list)
+        # Phase 3: wait for the gathers. Params are views into the tapes, so there
+        # is nothing to copy back.
+        for work in gathers:
+            work.wait()

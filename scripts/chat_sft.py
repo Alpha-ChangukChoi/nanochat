@@ -453,7 +453,7 @@ while True:
         scaler.update()
     else:
         optimizer.step()
-    model.zero_grad(set_to_none=True)
+    optimizer.zero_grad() # zeroes the flat grad tapes in place (do NOT sever p.grad views)
     synchronize()
     t1 = time.time()
     dt = t1 - t0

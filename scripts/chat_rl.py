@@ -298,7 +298,7 @@ for step in range(num_steps):
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
     optimizer.step()
-    model.zero_grad(set_to_none=True)
+    optimizer.zero_grad() # zeroes the flat grad tapes in place (do NOT sever p.grad views)
     wandb_run.log({
         "step": step,
         "lrm": lrm,

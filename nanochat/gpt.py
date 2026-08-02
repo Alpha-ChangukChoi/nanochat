@@ -397,10 +397,8 @@ class GPT:
         for p in self.params.values():
             p.requires_grad_(True)
 
-    def zero_grad(self, set_to_none=True):
-        assert set_to_none, "only set_to_none=True is supported"
-        for p in self.params.values():
-            p.grad = None
+    # note: no zero_grad here - use optimizer.zero_grad(), which zeroes the flat
+    # grad tapes without severing the p.grad views (see MuonAdamW in optim.py)
 
     # train/eval are no-ops (no dropout/batchnorm in this model), kept for API compatibility
     def train(self):
