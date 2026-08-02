@@ -4,6 +4,24 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-08-02: Functional rewrite of gpt.py + optim.py (merged)
+
+Removed nn.Module entirely: `init_params()`/`init_buffers()` return flat name -> tensor dicts, `forward(params, buffers, idx, ...)` is a pure function, and a thin GPT shell keeps the downstream API (checkpoint keys unchanged). FP8 is now just a `matmul=fp8_matmul` argument, and in MuonAdamW each Muon group's matrices live permanently in one stacked (K, m, n) tensor with params/grads as views into it, so the optimizer step is in-place reduce_scatter -> fused update -> in-place all_gather with no per-step stack/copy. Verified bitwise-identical init/logits/grads at d12, and a full d12 A/B is statistical twins with master at parity wall clock; -132 LOC, ~0.5 GiB less peak VRAM. Gotchas for the future: use F.embedding (not `wte[idx]`, whose scatter-add backward cost ~5%/step), and Optimizer.load_state_dict replaces the param_group dicts, so access groups by index.
+
+---
+
+## 2026-08-02: Softcap on the relu^2 MLP activation, from Kimi K3 (negative)
+
+Tried `cap * tanh(x / cap)` after relu^2 with cap=100 (K3's motivation: bound activation outliers for low-precision training). Slightly worse results, skipping given that we don't currently quantize for inference anyway, but when we do this might be worth revisiting.
+
+---
+
+## 2026-08-02: Per-head Muon, from Kimi K3 (negative)
+
+K3 orthogonalizes q/k/v Muon updates per attention head instead of per matrix. Tried it: neutral at d12-d16, then ~1.3% compute cost at d20/d24. Likely our MuonEq row equilibration already flattens the per-head scale disparity that K3's baseline suffers from. Not adopted.
+
+---
+
 ## 2026-05-05: DyT for d12 pretraining (negative)
 
 Tried replacing normalization with [DyT](https://arxiv.org/abs/2503.10622) for d12-scale pretraining following some [hype](https://x.com/LodestoneRock/status/2050367217087512953) on X.
