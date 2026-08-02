@@ -336,9 +336,10 @@ class GPT:
     and mirrors the parts of the nn.Module API that downstream code relies on
     (forward/__call__, state_dict, parameters, zero_grad, setup_optimizer, ...).
 
-    The shell's forward always runs the eager free function, which handles varying
-    shapes (Engine/KV-cache inference, evals). Training scripts compile the free
-    `forward` directly and call it with model.params - same weights, no split model.
+    The shell's forward runs the free function eagerly, which handles varying
+    shapes (Engine/KV-cache inference, evals). Training scripts compile this same
+    method - fwd = torch.compile(model.forward) - for the fixed-shape hot path:
+    same weights, no split model, and the constants (cos/sin/config) stay internal.
     """
 
     def __init__(self, config, device, params=None):
@@ -364,9 +365,9 @@ class GPT:
             for p in self.params.values():
                 p.requires_grad_(True)
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', matmul=bf16_matmul):
         return forward(self.params, idx, config=self.config, cos=self.cos, sin=self.sin,
-                       targets=targets, kv_cache=kv_cache, loss_reduction=loss_reduction)
+                       targets=targets, kv_cache=kv_cache, loss_reduction=loss_reduction, matmul=matmul)
 
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)

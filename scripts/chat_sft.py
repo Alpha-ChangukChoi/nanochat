@@ -20,7 +20,6 @@ from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, a
 from nanochat.logfmt import format_record, format_invocation
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state, get_checkpoint_dir
-from nanochat.gpt import forward as gpt_forward
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3
@@ -117,13 +116,9 @@ for name, fallback, source in [
     else:
         print0(f"Using {name}={arg_val}")
 
-# Compile the forward pass for training and fixed-shape evals. Varying-shape
-# inference (Engine / ChatCORE) uses the eager model.forward with the same params.
-fwd = torch.compile(gpt_forward, dynamic=False)
-def train_forward(x, y, loss_reduction='mean'):
-    loss = fwd(model.params, x, config=model.config, cos=model.cos, sin=model.sin,
-               targets=y, loss_reduction=loss_reduction)
-    return loss
+# Compile the model's forward pass for training and fixed-shape evals.
+# Varying-shape inference (Engine / ChatCORE) uses the eager model.forward directly.
+fwd = torch.compile(model.forward, dynamic=False)
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -347,7 +342,7 @@ while True:
     if last_step or (args.eval_every > 0 and step % args.eval_every == 0):
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        val_bpb = evaluate_bpb(train_forward, val_loader, eval_steps, token_bytes)
+        val_bpb = evaluate_bpb(fwd, val_loader, eval_steps, token_bytes)
         print0(format_record("eval", step=step, val_bpb=round(val_bpb, 6)))
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -428,7 +423,7 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = train_forward(x, y)
+        loss = fwd(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:

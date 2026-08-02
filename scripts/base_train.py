@@ -24,7 +24,7 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig, bf16_matmul, forward as gpt_forward
+from nanochat.gpt import GPT, GPTConfig, bf16_matmul
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.logfmt import format_record, format_invocation
@@ -174,21 +174,11 @@ if args.fp8:
         print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) for all block matmuls + lm_head (ve_gate stays bf16)")
 
 # -----------------------------------------------------------------------------
-# Compile the forward pass used for training and fixed-shape evals. The compiled
-# function and the eager model.forward share the same params dict; evals with
-# varying shapes (CORE, sampling) simply call the eager model directly.
+# Compile the model's forward pass for training and fixed-shape evals (its default
+# matmul is bf16, so evals need no special handling even when training in FP8).
+# Varying-shape inference (CORE, sampling) uses the eager model.forward directly.
 
-fwd = torch.compile(gpt_forward, dynamic=False) # training inputs never change shape so dynamic=False is safe
-
-def train_forward(x, y):
-    loss = fwd(model.params, x, config=model_config, cos=model.cos, sin=model.sin,
-               targets=y, matmul=train_matmul)
-    return loss
-
-def eval_forward(x, y, loss_reduction='mean'):
-    loss = fwd(model.params, x, config=model_config, cos=model.cos, sin=model.sin,
-               targets=y, loss_reduction=loss_reduction, matmul=bf16_matmul)
-    return loss
+fwd = torch.compile(model.forward, dynamic=False) # training inputs never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -378,7 +368,7 @@ while True:
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        val_bpb = evaluate_bpb(eval_forward, val_loader, eval_steps, token_bytes)
+        val_bpb = evaluate_bpb(fwd, val_loader, eval_steps, token_bytes)
         # 8 decimals so that even tiny CPU-scale runs (~1e-6 EFLOPs/step) stay nonzero
         print0(format_record("eval", step=step, eflops=round(flops_so_far / 1e18, 8), val_bpb=round(val_bpb, 6)))
         if val_bpb < min_val_bpb:
@@ -456,7 +446,7 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = train_forward(x, y)
+        loss = fwd(x, y, matmul=train_matmul)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
