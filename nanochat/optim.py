@@ -222,7 +222,10 @@ class MuonAdamW(torch.optim.Optimizer):
 
     The tape layout depends on world_size, so it is a runtime detail of the
     optimizer: checkpoints save the ordinary name -> tensor dict (the model) and
-    this rank's chunk-sized optimizer state; resuming requires the same world_size.
+    this rank's chunk-sized optimizer state. Optimizer-state resume therefore
+    requires the same world_size (enforced loudly in load_state_dict; this was
+    equally true of the previous per-param ZeRO sharding). Model checkpoints are
+    unaffected and load at any world size.
 
     On a single rank (no process group) all communication is skipped and the
     "chunk" is the whole tape - Muon still gets stack-free (K, m, n) views.
@@ -398,6 +401,26 @@ class MuonAdamW(torch.optim.Optimizer):
             )
             self._grad_tapes.append(grad_tape)
             self._adamw_tapes.append(dict(theta=theta, grad_tape=grad_tape, chunk=chunk, segments=segments, anchor=anchor))
+
+    def state_dict(self):
+        # The sharded state layout is a function of world_size, so stamp it into the
+        # state dict; load_state_dict validates it. Without the check, resuming at a
+        # LARGER world size would slice smaller-but-in-bounds regions of the loaded
+        # tapes and silently train on the wrong moments (no shape error anywhere).
+        sd = super().state_dict()
+        sd['world_size'] = self.world_size
+        return sd
+
+    def load_state_dict(self, state_dict):
+        saved_world_size = state_dict.get('world_size')
+        assert saved_world_size == self.world_size, (
+            f"optimizer state was saved with world_size={saved_world_size} but this run has "
+            f"world_size={self.world_size}. The sharded state layout depends on world_size, "
+            f"so optimizer-state resume requires the same number of ranks. "
+            f"(Model checkpoints are unaffected and load at any world size.)"
+        )
+        state_dict = {k: v for k, v in state_dict.items() if k != 'world_size'}
+        super().load_state_dict(state_dict)
 
     def _ensure_grad_views(self):
         """
