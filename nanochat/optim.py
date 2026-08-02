@@ -216,10 +216,10 @@ class MuonAdamW(torch.optim.Optimizer):
     Optimizer state is sharded by rank, so state resume requires the same
     world_size (enforced in load_state_dict; model checkpoints are unaffected).
 
-    The grad-stack aliasing for Muon params is an optimization, not a
-    correctness requirement: step() adopts any externally assigned p.grad back
-    into the stack before reducing. Use this optimizer's zero_grad(), which
-    zeroes the grad stacks in place instead of severing the views.
+    Muon p.grad tensors are views into the grad stacks and must stay that way
+    (step() asserts it): if you ever set gradients manually, write them in
+    place. Use this optimizer's zero_grad(), which zeroes the grad stacks
+    instead of severing the views.
 
     Arguments:
         param_groups: List of dicts, each containing:
@@ -299,37 +299,26 @@ class MuonAdamW(torch.optim.Optimizer):
         super().load_state_dict(state_dict)
 
     def zero_grad(self, set_to_none=True):
-        """Zero the Muon grad stacks in place (keeping the p.grad views aliased into
+        """Zero the Muon grad stacks in place (the p.grad views stay aliased into
         them) and drop the AdamW grads like a regular set_to_none zero_grad."""
         for group, stack in zip(self.param_groups, self._stacks):
             if stack is not None:
                 stack['grad_stack'].zero_()
-                for j, p in enumerate(group['params']):
-                    p.grad = stack['grad_stack'][j]
             else:
                 for p in group['params']:
                     p.grad = None
 
-    def _adopt_muon_grads(self):
-        """Normally autograd accumulates directly into the grad stacks because every
-        Muon p.grad is a stack view. If the aliasing was severed (external p.grad
-        assignment), adopt the values into the stack and restore the view, so the
-        reduce always sees the real gradients."""
-        for group, stack in zip(self.param_groups, self._stacks):
-            if stack is None:
-                continue
-            for j, p in enumerate(group['params']):
-                view = stack['grad_stack'][j]
-                if p.grad is None:
-                    view.zero_()
-                elif p.grad.data_ptr() != view.data_ptr():
-                    view.copy_(p.grad)
-                p.grad = view
-
     @torch.no_grad()
     def step(self):
         W, r = self.world_size, self.rank
-        self._adopt_muon_grads()
+        # Muon grads accumulate directly into the grad stacks because every p.grad is
+        # a stack view (set up in __init__). If p.grad were ever reassigned, the reduce
+        # below would consume stale gradients, so fail loudly here.
+        for group, stack in zip(self.param_groups, self._stacks):
+            if stack is not None:
+                for j, p in enumerate(group['params']):
+                    assert p.grad is not None and p.grad.data_ptr() == stack['grad_stack'][j].data_ptr(), \
+                        "Muon p.grad must be its grad-stack view; write gradients in place, don't reassign p.grad"
 
         # Phase 1: launch all async reduce ops. Everything is reduced in place:
         # the output chunk/slice is a view into the gradient it is reduced from.
