@@ -38,7 +38,11 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         # torch.save deduplicates shared storage - saving the views directly would
         # serialize the whole world_size-dependent tape layout into the file. The
         # tapes are a runtime optimization; checkpoints must stay independent of them.
-        model_data = {k: v.detach().clone() for k, v in model_data.items()}
+        # Copy via CPU: torch.save stages GPU tensors through CPU anyway, and cloning
+        # on-device would spike VRAM by a full model - a late OOM risk for a job that
+        # has been stepping fine and only saves much later. copy=True forces a copy
+        # even when the tensor is already on CPU (it might still be a tape view).
+        model_data = {k: v.detach().to("cpu", copy=True) for k, v in model_data.items()}
         # Save the model state parameters
         model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
         torch.save(model_data, model_path)
