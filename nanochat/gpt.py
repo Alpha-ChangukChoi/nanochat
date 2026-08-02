@@ -269,20 +269,20 @@ def forward(params, buffers, idx, *, config, targets=None, kv_cache=None, loss_r
     backout_layer = n_layer // 2  # cache at halfway point
     x_backout = None
     for i in range(n_layer):
-        layer = f"transformer.h.{i}."
+        p = lambda name: params[f"transformer.h.{i}.{name}"]  # noqa: E731
         x = resid_lambdas[i] * x + x0_lambdas[i] * x0
 
         # Attention block
         xn = norm(x)
         # Project the input to get queries, keys, and values
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
-        q = matmul(xn, params[layer + "attn.c_q.weight"]).view(B, T, n_head, head_dim)
-        k = matmul(xn, params[layer + "attn.c_k.weight"]).view(B, T, n_kv_head, head_dim)
-        v = matmul(xn, params[layer + "attn.c_v.weight"]).view(B, T, n_kv_head, head_dim)
+        q = matmul(xn, p("attn.c_q.weight")).view(B, T, n_head, head_dim)
+        k = matmul(xn, p("attn.c_k.weight")).view(B, T, n_kv_head, head_dim)
+        v = matmul(xn, p("attn.c_v.weight")).view(B, T, n_kv_head, head_dim)
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if f"value_embeds.{i}.weight" in params:
             ve = F.embedding(idx, params[f"value_embeds.{i}.weight"]).to(x.dtype).view(B, T, n_kv_head, head_dim)
-            gate = 3 * torch.sigmoid(bf16_matmul(xn[..., :VE_GATE_CHANNELS], params[layer + "attn.ve_gate.weight"]))  # (B, T, n_kv_head), range (0, 3)
+            gate = 3 * torch.sigmoid(bf16_matmul(xn[..., :VE_GATE_CHANNELS], p("attn.ve_gate.weight")))  # (B, T, n_kv_head), range (0, 3)
             v = v + gate.unsqueeze(-1) * ve
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         q = apply_rotary_emb(q, cos_t, sin_t)
@@ -307,13 +307,13 @@ def forward(params, buffers, idx, *, config, targets=None, kv_cache=None, loss_r
             )
         # Re-assemble the heads and project back to the residual stream
         y = y.contiguous().view(B, T, -1)
-        x = x + matmul(y, params[layer + "attn.c_proj.weight"])
+        x = x + matmul(y, p("attn.c_proj.weight"))
 
         # MLP block
         xn = norm(x)
-        h = matmul(xn, params[layer + "mlp.c_fc.weight"])
+        h = matmul(xn, p("mlp.c_fc.weight"))
         h = F.relu(h).square()
-        x = x + matmul(h, params[layer + "mlp.c_proj.weight"])
+        x = x + matmul(h, p("mlp.c_proj.weight"))
 
         if i == backout_layer:
             x_backout = x
