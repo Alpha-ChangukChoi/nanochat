@@ -206,7 +206,16 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         while len(conv_buffer) < buffer_size:
             conversation = dataset[cursor]
             ids, mask = tokenizer.render_conversation(conversation)
-            conv_buffer.append((ids, mask))
+            # Drop conversations that can never be placed. The packer below only ever
+            # selects a conversation that fits entirely, so an over-long one is never
+            # popped: it accumulates until all buffer_size slots hold one, after which
+            # no conversation ever fits again, every row is pure padding, every target
+            # is -1, and training silently continues with an all-NaN loss and zero
+            # gradients. Harmless at the default max_seq_len=2048 (the data is already
+            # capped there), fatal at runcpu.sh's 512, where 41% of conversations are
+            # over-long and the stall arrives within 3 steps.
+            if len(ids) <= row_capacity:
+                conv_buffer.append((ids, mask))
             cursor += ddp_world_size
             if cursor >= dataset_size:
                 cursor = cursor % dataset_size
@@ -294,6 +303,16 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         for i, content_len in enumerate(row_lengths):
             if content_len < row_capacity:
                 targets[i, content_len-1:] = -1
+
+        # A micro-batch with no supervised token at all makes cross_entropy average
+        # over zero elements: the loss is NaN but the gradient is all zeros, so the
+        # run keeps going, learns nothing, and only the printed loss shows it. Fail
+        # loudly instead of training on nothing.
+        assert (targets >= 0).any(), (
+            f"micro-batch has zero supervised targets ({split} split): every row is "
+            f"padding or masked prompt. Check that conversations fit in max_seq_len="
+            f"{args.max_seq_len}."
+        )
 
         yield inputs, targets
 
